@@ -22,6 +22,9 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
+        val fft = FFT(256)
+
+
     }
 
     private fun startWithPermissionCheck() {
@@ -61,8 +64,8 @@ class MainActivity : AppCompatActivity() {
                     val c = kalman.Correct(m)
 
                     val bpm = it.copy(value = c.get(0, 0).toInt())
-                    Log.v("HeartRateOmeter", "[onBpm] ${it.value} => ${bpm.value}")
-                    onBpm(bpm)
+                    //Log.v("HeartRateOmeter", "[onBpm] ${it.value} => ${bpm.value}")
+                    onBpm(it)
                 }, Throwable::printStackTrace)
 
         subscription?.add(bpmUpdates)

@@ -1,5 +1,6 @@
 package net.kibotu.heartrateometer;
 
+import android.graphics.Color;
 import android.util.Log;
 
 import java.util.ArrayList;
@@ -12,21 +13,15 @@ import java.util.Collections;
  * @author <a href="phishman3579@gmail.com">Justin Wetherell</a>
  */
 public class MathHelper {
-
-    //vvvvvvvvvvvv image processing vvvvvvvvvvvv
-
-    private static int decodeYUV420SPtoRedSum(byte[] yuv420sp, int width, int height) {
+    private static float[] decodeYUV420SPtoRedSum(byte[] yuv420sp, int width, int height) {
         if (yuv420sp == null) {
-            return 0;
+            return new float[] { 0f, 0f, 0f, 0f };
         }
 
         final int frameSize = width * height;
-        int sum1 = 0;
-        int sum2 = 0;
-        int sum3 = 0;
-        int sum4 = 0;
-        int widthMiddle = width / 2;
-        int heightMiddle = height / 2;
+        int sumRed = 0;
+        int sumGreen = 0;
+        int sumBlue = 0;
 
         for (int heightIndex = 0, pixelIndex = 0; heightIndex < height; heightIndex++) {
             int uvp = frameSize + (heightIndex >> 1) * width, u = 0, v = 0;
@@ -70,39 +65,30 @@ public class MathHelper {
                         | ((bluePixel >> 10) & 0xff);
 
                 int red = (pixel >> 16) & 0xff;
+                int green = (pixel >> 8) & 0xff;
+                int blue = (pixel) & 0xff;
 
-                if (widthIndex < widthMiddle && heightIndex < heightMiddle)
-                    sum1 += red;
-                else if (widthIndex < widthMiddle && heightIndex > heightMiddle)
-                    sum2 += red;
-                else if (widthIndex > widthMiddle && heightIndex < heightMiddle)
-                    sum3 += red;
-                else if (widthIndex > widthMiddle && heightIndex > heightMiddle)
-                    sum4 += red;
+                sumRed += red;
+                sumGreen += green;
+                sumBlue += blue;
             }
         }
 
-        //return Collections.max(Arrays.asList(sum1,sum2,sum3,sum4));
-        //return sum1 + sum2 + sum3 + sum4;
-        ArrayList<Integer> rates = new ArrayList<>(Arrays.asList(sum1, sum2, sum3, sum4));
-        int max1 = Collections.max(rates);
-        rates.remove((Object)max1);
-        return max1 + Collections.max(rates);
+        return new float[] { sumRed, sumGreen, sumBlue };
     }
 
-    public static int decodeYUV420SPtoRedAvg(byte[] yuv420sp, int width, int height) {
+    public static float[] decodeYUV420SPtoRGBHAverage(byte[] yuv420sp, int width, int height) {
         if (yuv420sp == null) {
-            return 0;
+            return new float[] { 0f, 0f, 0f, 0f };
         }
 
         final int frameSize = width * height;
 
-        int sum = decodeYUV420SPtoRedSum(yuv420sp, width, height);
+        float[] sum = decodeYUV420SPtoRedSum(yuv420sp, width, height);
+        float[] toreturn = new float[3];
+        for (int i = 0; i < sum.length; i++)
+            toreturn[i] = sum[i] / frameSize;
 
-        //Log.d("RED", "decodeYUV420SPtoRedAvg: " + sum);
-        return (sum / (frameSize / 2));
-        //return sum / frameSize;
+        return toreturn;
     }
-
-    //^^^^^^^^^^^^ image processing ^^^^^^^^^^^^
 }

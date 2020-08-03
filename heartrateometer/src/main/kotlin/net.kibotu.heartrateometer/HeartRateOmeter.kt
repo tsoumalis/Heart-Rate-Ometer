@@ -1,9 +1,12 @@
+@file:Suppress("DEPRECATION")
+
 package net.kibotu.heartrateometer
 
 import android.content.Context
 import android.graphics.Point
 import android.hardware.Camera
 import android.os.Build
+import android.os.Handler
 import android.os.PowerManager
 import android.util.DisplayMetrics
 import android.util.Log
@@ -16,8 +19,14 @@ import io.reactivex.Observable
 import io.reactivex.subjects.PublishSubject
 import org.apache.commons.collections4.queue.CircularFifoQueue
 import java.lang.ref.WeakReference
+import java.util.*
+import java.util.Arrays.asList
 import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.reflect.KFunction1
+import kotlin.collections.ArrayList
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.roundToLong
+import kotlin.math.sqrt
 
 
 /**
@@ -35,26 +44,32 @@ open class HeartRateOmeter {
 
     data class Bpm(val value: Int, val type: PulseType)
 
+    private val MIN_RED_AVG_VALUE = 120
+    private val OTHER_COLOR_MAX_VALUE = 90
+    private val FINGER_DEBOUNCE = 2000
+
     private var wakeLockTimeOut: Long = 10_000
 
-    protected var surfaceHolder: SurfaceHolder? = null
+    private var surfaceHolder: SurfaceHolder? = null
 
-    protected var wakelock: PowerManager.WakeLock? = null
+    private var wakelock: PowerManager.WakeLock? = null
 
-    protected lateinit var previewCallback: Camera.PreviewCallback
+    private lateinit var previewCallback: Camera.PreviewCallback
 
-    protected lateinit var surfaceCallback: SurfaceHolder.Callback
+    private lateinit var surfaceCallback: SurfaceHolder.Callback
 
     protected val publishSubject: PublishSubject<Bpm>
 
-    protected var context: WeakReference<Context>? = null
+    private var context: WeakReference<Context>? = null
 
-    protected var cameraSupport: CameraSupport? = null
+    private var cameraSupport: CameraSupport? = null
 
     private var powerManager: PowerManager? = null
         get() = context?.get()?.getSystemService(Context.POWER_SERVICE) as? PowerManager?
 
     private var fingerDetectionListener: ((Boolean) -> Unit)? = null
+    private var chartDataListener: ((Int) -> Unit)? = null
+    private var rawDataListener: ((Long, Float, Float, Float) -> Unit)? = null
 
     init {
         publishSubject = PublishSubject.create<Bpm>()
@@ -71,7 +86,7 @@ open class HeartRateOmeter {
         return bpmUpdates(surfaceView.context, surfaceView.holder)
     }
 
-    protected fun bpmUpdates(context: Context, surfaceHolder: SurfaceHolder): Observable<Bpm> {
+    private fun bpmUpdates(context: Context, surfaceHolder: SurfaceHolder): Observable<Bpm> {
 
         previewCallback = if (averageTimer == -1)
             createCameraPreviewCallback()
@@ -90,7 +105,7 @@ open class HeartRateOmeter {
                 .doOnDispose { cleanUp() }
     }
 
-    protected fun start() {
+    private fun start() {
         log("start")
 
         wakelock = powerManager?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, context?.get()?.javaClass?.canonicalName)
@@ -157,7 +172,7 @@ open class HeartRateOmeter {
 
     private fun getScreenDimensionsLandscape(): Dimension {
         val (width, height) = getScreenDimensions()
-        return Dimension(Math.max(width, height), Math.min(width, height))
+        return Dimension(max(width, height), min(width, height))
     }
 
     private fun startPreview() {
@@ -166,7 +181,7 @@ open class HeartRateOmeter {
         cameraSupport?.startPreview()
     }
 
-    protected fun setCameraParameter(width: Int, height: Int) {
+    private fun setCameraParameter(width: Int, height: Int) {
 
         val parameters = cameraSupport?.parameters
         parameters?.flashMode = Camera.Parameters.FLASH_MODE_TORCH
@@ -191,7 +206,7 @@ open class HeartRateOmeter {
         cameraSupport?.parameters = parameters
     }
 
-    protected fun createSurfaceHolderCallback(): SurfaceHolder.Callback {
+    private fun createSurfaceHolderCallback(): SurfaceHolder.Callback {
         return object : SurfaceHolder.Callback {
 
             override fun surfaceCreated(holder: SurfaceHolder) {
@@ -213,19 +228,25 @@ open class HeartRateOmeter {
             field = value
         }
 
-    protected fun createCameraPreviewCallback(): Camera.PreviewCallback {
+    private fun createCameraPreviewCallback(): Camera.PreviewCallback {
         return object : Camera.PreviewCallback {
 
             val PROCESSING = AtomicBoolean(false)
-            val sampleSize = 512
+            val sampleSize = 128
             var counter = 0
             var bpm: Int = -1
 
             val fft = FFT(sampleSize)
 
             val sampleQueue = CircularFifoQueue<Double>(sampleSize)
+            val redQueue = CircularFifoQueue<Double>(sampleSize)
+            val greenQueue = CircularFifoQueue<Double>(sampleSize)
             val timeQueue = CircularFifoQueue<Long>(sampleSize)
-            val bpmQueue = CircularFifoQueue<Int>(40)
+            val bpmQueue = CircularFifoQueue<Int>(150)
+            val bpmArrayList = ArrayList<Int>()
+            val powerList = ArrayList<Double>()
+
+            var waitingToChangeFingerState = false
 
             override fun onPreviewFrame(data: ByteArray?, camera: Camera?) {
 
@@ -252,17 +273,39 @@ open class HeartRateOmeter {
                 val width = size.width
                 val height = size.height
 
+                val rgbh = MathHelper.decodeYUV420SPtoRGBHAverage(data.clone(), width, height)
+                val imgAvg = (rgbh[0] + rgbh[1]).toInt()
 
-                val imgAvg = MathHelper.decodeYUV420SPtoRedAvg(data.clone(), width, height)
-                if (imgAvg == 0 || imgAvg < 199) {
+                chartDataListener?.invoke(imgAvg)
+                if (fingerNotValid(rgbh)) {
                     PROCESSING.set(false)
                     fingerDetected = false
                     return
                 }
 
+                if (waitingToChangeFingerState) {
+                    PROCESSING.set(false)
+                    return
+                }
+
+                if (!fingerDetected) {
+                    waitingToChangeFingerState = true
+                    Handler().postDelayed({
+                        if (!fingerNotValid(rgbh))
+                            fingerDetected = true
+                        waitingToChangeFingerState = false
+                    }, FINGER_DEBOUNCE.toLong())
+                    PROCESSING.set(false)
+                    return
+                }
+
                 fingerDetected = true
 
+                rawDataListener?.invoke(System.currentTimeMillis(), rgbh[0], rgbh[1], rgbh[2])
+
                 sampleQueue.add(imgAvg.toDouble())
+                redQueue.add(rgbh[0].toDouble())
+                greenQueue.add(rgbh[1].toDouble())
                 timeQueue.add(System.currentTimeMillis())
 
                 val y = DoubleArray(sampleSize)
@@ -279,26 +322,41 @@ open class HeartRateOmeter {
 
                 fft.fft(x!!, y)
 
-                val low = Math.round(((sampleSize * 40).toDouble() / 60.0 / Fs).toFloat())
-                val high = Math.round(((sampleSize * 160).toDouble() / 60.0 / Fs).toFloat())
+                val low = ((sampleSize * 50).toDouble() / 60.0 / Fs).toFloat().roundToLong()
+                val high = ((sampleSize * 160).toDouble() / 60.0 / Fs).toFloat().roundToLong()
 
                 var bestI = 0
                 var bestV = 0.0
-                for (i in low until high) {
-                    val value = Math.sqrt(x[i] * x[i] + y[i] * y[i])
+                for (i in low.toInt() until high.toInt()) {
+                    val value = sqrt(x[i] * x[i] + y[i] * y[i])
 
                     if (value > bestV) {
                         bestV = value
                         bestI = i
                     }
                 }
+                powerList.add(bestV)
 
-                bpm = Math.round((bestI.toDouble() * Fs * 60.0 / sampleSize).toFloat())
+                if (bestV < 30)
+                {
+                    PROCESSING.set(false)
+                    return
+                }
+
+                bpm = (bestI.toDouble() * Fs * 60.0 / sampleSize).toFloat().roundToLong().toInt()
                 bpmQueue.add(bpm)
+                bpmArrayList.add(bpm)
 
-                // log("bpm=$bpm")
+                var sum = 0
+                for (i in bpmQueue){
+                    sum += i
+                }
 
-                publishSubject.onNext(Bpm(bpm, PulseType.ON))
+                val average = sum / bpmQueue.size
+
+                log("bpm=$bpm")
+
+                publishSubject.onNext(Bpm(average, PulseType.ON))
 
                 counter++
 
@@ -307,29 +365,40 @@ open class HeartRateOmeter {
         }
     }
 
-    protected fun createCameraPreviewCallback2(): Camera.PreviewCallback {
+    fun fingerNotValid(rgbh: FloatArray): Boolean {
+        val imageRedAvg = rgbh[0]
+        val imageGreenAvg = rgbh[1]
+        val imageBlueAvg = rgbh[2]
+        return (imageRedAvg < MIN_RED_AVG_VALUE || imageGreenAvg > imageRedAvg ||
+                imageBlueAvg > imageRedAvg ||
+                imageBlueAvg > OTHER_COLOR_MAX_VALUE ||
+                imageGreenAvg > OTHER_COLOR_MAX_VALUE)
+    }
+
+    private fun createCameraPreviewCallback2(): Camera.PreviewCallback {
 
         return object : Camera.PreviewCallback {
 
-            internal var beatsIndex = 0
-            internal var beats = 0.0
-            internal var startTime = System.currentTimeMillis()
-            internal var averageIndex = 0
+            var beatsIndex = 0
+            var beats = 0.0
+            var startTime = System.currentTimeMillis()
+            var averageIndex = 0
 
-            internal val PROCESSING = AtomicBoolean(false)
+            val PROCESSING = AtomicBoolean(false)
 
-            internal val AVERAGE_ARRAY_SIZE = 4
-            internal val AVERAGE_ARRAY = IntArray(AVERAGE_ARRAY_SIZE)
+            val AVERAGE_ARRAY_SIZE = 6
+            val AVERAGE_ARRAY = IntArray(AVERAGE_ARRAY_SIZE)
 
-            internal val BEATS_ARRAY_SIZE = 3
-            internal val BEATS_ARRAY = IntArray(BEATS_ARRAY_SIZE)
+            val BEATS_ARRAY_SIZE = 3
+            val BEATS_ARRAY = IntArray(BEATS_ARRAY_SIZE)
 
-            internal var currentPixelType: PulseType = PulseType.OFF
+            var currentPixelType: PulseType = PulseType.OFF
+            var fingerDetectedTimestamp = 0
+            var waitingToChangeFingerState = false
 
             private var previousBeatsAverage: Int = 0
 
             override fun onPreviewFrame(data: ByteArray?, camera: Camera) {
-
 
                 if (data == null) {
                     log("Data is null!")
@@ -352,17 +421,33 @@ open class HeartRateOmeter {
 
                 // Logger.d("SIZE: width: " + width + ", height: " + height);
 
-                val imageAverage = MathHelper.decodeYUV420SPtoRedAvg(data.clone(), width, height)
-                log("imageAverage not started: " + imageAverage)
-                val threshold = 179
-                if (imageAverage == 0 || imageAverage < threshold) {
+                val rgbh = MathHelper.decodeYUV420SPtoRGBHAverage(data.clone(), width, height)
+                val imageAverage = (rgbh[0].toInt() + rgbh[1].toInt()) / 2
+
+                if (fingerNotValid(rgbh)) {
                     PROCESSING.set(false)
                     fingerDetected = false
                     return
                 }
-                fingerDetected = true
 
-                log("imageAverage: " + imageAverage)
+                if (waitingToChangeFingerState) {
+                    PROCESSING.set(false)
+                    return
+                }
+                if (!fingerDetected) {
+                    waitingToChangeFingerState = true
+                    Handler().postDelayed({
+                        if (!fingerNotValid(rgbh))
+                            fingerDetected = true
+                        waitingToChangeFingerState = false
+                    }, FINGER_DEBOUNCE.toLong())
+                    PROCESSING.set(false)
+                    return
+                }
+                chartDataListener?.invoke(imageAverage)
+                rawDataListener?.invoke(System.currentTimeMillis(), rgbh[0], rgbh[1], rgbh[2])
+
+                log("imageAverage: $imageAverage")
 
                 var averageArrayAverage = 0
                 var averageArrayCount = 0
@@ -376,7 +461,7 @@ open class HeartRateOmeter {
 
                 val rollingAverage = if (averageArrayCount > 0) averageArrayAverage / averageArrayCount else 0
 
-                log("rollingAverage: " + rollingAverage)
+                log("rollingAverage: $rollingAverage")
 
                 var newType = currentPixelType
 
@@ -403,11 +488,11 @@ open class HeartRateOmeter {
 
                 val endTime = System.currentTimeMillis()
                 val totalTimeInSecs = (endTime - startTime) / 1000.0
-                log("totalTimeInSecs: " + totalTimeInSecs + " >= averageTimer: " + averageTimer)
+                log("totalTimeInSecs: $totalTimeInSecs >= averageTimer: $averageTimer")
                 if (totalTimeInSecs >= averageTimer) {
                     val beatsPerSecond = beats / totalTimeInSecs
                     val beatsPerMinute = (beatsPerSecond * 60.0).toInt()
-                    if (beatsPerMinute < 30 || beatsPerMinute > 180) {
+                    if (beatsPerMinute < 40 || beatsPerMinute > 180) {
                         startTime = System.currentTimeMillis()
                         beats = 0.0
                         PROCESSING.set(false)
@@ -433,7 +518,7 @@ open class HeartRateOmeter {
 
                     val beatsAverage = beatsArrayAverage / beatsArrayCount
                     previousBeatsAverage = beatsAverage
-                    log("beatsAverage: " + beatsAverage)
+                    log("beatsAverage: $beatsAverage")
                     publishSubject.onNext(Bpm(beatsAverage, currentPixelType))
 
                     startTime = System.currentTimeMillis()
@@ -448,7 +533,7 @@ open class HeartRateOmeter {
     /**
      * An empty immutable `long` array.
      */
-    protected val EMPTY_LONG_ARRAY = LongArray(0)
+    private val EMPTY_LONG_ARRAY = LongArray(0)
 
     /**
      *
@@ -477,7 +562,7 @@ open class HeartRateOmeter {
     /**
      * An empty immutable `double` array.
      */
-    protected val EMPTY_DOUBLE_ARRAY = DoubleArray(0)
+    private val EMPTY_DOUBLE_ARRAY = DoubleArray(0)
 
     /**
      *
@@ -503,7 +588,7 @@ open class HeartRateOmeter {
         return result
     }
 
-    protected fun getSmallestPreviewSize(width: Int, height: Int, parameters: Camera.Parameters?): Camera.Size? {
+    private fun getSmallestPreviewSize(width: Int, height: Int, parameters: Camera.Parameters?): Camera.Size? {
 
         var result: Camera.Size? = null
 
@@ -524,7 +609,7 @@ open class HeartRateOmeter {
         return result
     }
 
-    protected fun cleanUp() {
+    private fun cleanUp() {
         log("cleanUp")
 
         if (wakelock?.isHeld == true) {
@@ -547,6 +632,16 @@ open class HeartRateOmeter {
 
     fun setFingerDetectionListener(fingerDetectionListener:((Boolean) -> Unit)?): HeartRateOmeter {
         this.fingerDetectionListener = fingerDetectionListener
+        return this
+    }
+
+    fun setChartDataListener(chartDataListener:((Int) -> Unit)?): HeartRateOmeter {
+        this.chartDataListener = chartDataListener;
+        return this
+    }
+
+    fun setRawDataListener(rawDataListener:((Long, Float, Float, Float) -> Unit)?): HeartRateOmeter {
+        this.rawDataListener = rawDataListener;
         return this
     }
 }
